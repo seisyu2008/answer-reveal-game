@@ -81,14 +81,15 @@
     <h2>新しい部屋を作る</h2>
 
     <label>
-      公開までの時間
-      <select id="minutes">
-        <option value="1">1分</option>
-        <option value="3">3分</option>
-        <option value="5">5分</option>
-        <option value="10">10分</option>
-        <option value="15">15分</option>
-        <option value="30">30分</option>
+      公開方法
+      <select id="mode">
+        <option value="1">1分後</option>
+        <option value="3">3分後</option>
+        <option value="5">5分後</option>
+        <option value="10">10分後</option>
+        <option value="15">15分後</option>
+        <option value="30">30分後</option>
+        <option value="wait">2人の回答が揃ってから1分後</option>
       </select>
     </label>
 
@@ -134,8 +135,11 @@
   </div>
 
 <script>
-const SUPABASE_URL = "https://daztoxcjevdacvwhtboa.supabase.co";
-const SUPABASE_KEY = "sb_publishable_ED8zvFDCLnEFlf2ZRS5Yeg_V76Q3IdP";
+const SUPABASE_URL =
+  "https://daztoxcjevdacvwhtboa.supabase.co";
+
+const SUPABASE_KEY =
+  "sb_publishable_ED8zvFDCLnEFlf2ZRS5Yeg_V76Q3IdP";
 
 const db = supabase.createClient(
   SUPABASE_URL,
@@ -147,50 +151,91 @@ const params = new URLSearchParams(location.search);
 let roomId = params.get("room");
 let revealAt = params.get("reveal");
 let player = params.get("player");
+let mode = params.get("mode");
 
 const setup = document.getElementById("setup");
 const game = document.getElementById("game");
+const timer = document.getElementById("timer");
 
 function randomRoom() {
   return crypto.randomUUID();
 }
 
-document.getElementById("createRoom").onclick = () => {
-  const minutes =
-    Number(document.getElementById("minutes").value);
+document.getElementById("createRoom").onclick =
+async () => {
+
+  const choice =
+    document.getElementById("mode").value;
 
   roomId = randomRoom();
-
-  revealAt = new Date(
-    Date.now() + minutes * 60 * 1000
-  ).toISOString();
-
   player = "A";
+
+  if (choice === "wait") {
+    mode = "wait";
+    revealAt = null;
+  } else {
+    mode = "timer";
+    const minutes = Number(choice);
+
+    revealAt = new Date(
+      Date.now() + minutes * 60 * 1000
+    ).toISOString();
+  }
+
+  const { error } = await db
+    .from("rooms")
+    .insert({
+      room_id: roomId,
+      mode: mode,
+      reveal_at: revealAt
+    });
+
+  if (error) {
+    alert("部屋の作成に失敗しました");
+    console.error(error);
+    return;
+  }
 
   const url = new URL(location.href);
 
   url.searchParams.set("room", roomId);
-  url.searchParams.set("reveal", revealAt);
   url.searchParams.set("player", "A");
+  url.searchParams.set("mode", mode);
+
+  if (revealAt) {
+    url.searchParams.set("reveal", revealAt);
+  } else {
+    url.searchParams.delete("reveal");
+  }
 
   location.href = url.toString();
 };
 
-if (roomId && revealAt) {
+if (roomId && mode) {
+
   setup.classList.add("hidden");
   game.classList.remove("hidden");
 
   if (!player) player = "B";
 
-  startTimer();
+  if (mode === "wait") {
+    timer.textContent = "回答待ち";
+    watchRoom();
+  } else {
+    startTimer();
+  }
 }
 
-document.getElementById("copyUrl").onclick = async () => {
+document.getElementById("copyUrl").onclick =
+async () => {
+
   const url = new URL(location.href);
 
   url.searchParams.set("player", "B");
 
-  await navigator.clipboard.writeText(url.toString());
+  await navigator.clipboard.writeText(
+    url.toString()
+  );
 
   alert("相手用URLをコピーしました");
 };
@@ -206,33 +251,59 @@ async () => {
     return;
   }
 
-  const { error } = await db
-    .from("answers")
-    .insert({
-      room_id: roomId,
-      player: player,
-      answer: answer,
-      reveal_at: revealAt
-    });
+  document.getElementById("submitAnswer").disabled = true;
+
+  let error;
+
+  if (mode === "wait") {
+
+    const result = await db.rpc(
+      "submit_wait_answer",
+      {
+        p_room_id: roomId,
+        p_player: player,
+        p_answer: answer
+      }
+    );
+
+    error = result.error;
+
+  } else {
+
+    const result = await db
+      .from("answers")
+      .insert({
+        room_id: roomId,
+        player: player,
+        answer: answer,
+        reveal_at: revealAt
+      });
+
+    error = result.error;
+  }
 
   if (error) {
     console.error(error);
+
     document.getElementById("status").textContent =
       "送信に失敗しました";
+
+    document.getElementById("submitAnswer").disabled = false;
     return;
   }
 
   document.getElementById("answer").disabled = true;
-  document.getElementById("submitAnswer").disabled = true;
 
-  document.getElementById("status").textContent =
-    "回答を送信しました。公開時間までお待ちください。";
+  if (mode === "wait") {
+    document.getElementById("status").textContent =
+      "回答を送信しました。相手の回答を待っています。";
+  } else {
+    document.getElementById("status").textContent =
+      "回答を送信しました。公開時間までお待ちください。";
+  }
 };
 
 function startTimer() {
-
-  const timer =
-    document.getElementById("timer");
 
   const interval = setInterval(async () => {
 
@@ -262,6 +333,36 @@ function startTimer() {
   }, 250);
 }
 
+async function watchRoom() {
+
+  const interval = setInterval(async () => {
+
+    const { data, error } = await db
+      .from("rooms")
+      .select("reveal_at")
+      .eq("room_id", roomId)
+      .single();
+
+    if (error) {
+      console.error(error);
+      return;
+    }
+
+    if (data && data.reveal_at) {
+
+      clearInterval(interval);
+
+      revealAt = data.reveal_at;
+
+      document.getElementById("status").textContent =
+        "2人の回答が揃いました。1分後に公開します。";
+
+      startTimer();
+    }
+
+  }, 1000);
+}
+
 async function loadAnswers() {
 
   const { data, error } = await db
@@ -274,8 +375,13 @@ async function loadAnswers() {
     return;
   }
 
-  const a = data.find(x => x.player === "A");
-  const b = data.find(x => x.player === "B");
+  const a = data.find(
+    x => x.player === "A"
+  );
+
+  const b = data.find(
+    x => x.player === "B"
+  );
 
   document.getElementById("answerA").textContent =
     a ? a.answer : "未回答";
